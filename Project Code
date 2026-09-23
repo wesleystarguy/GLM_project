@@ -1,0 +1,827 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import IPython.display as display
+import polars as pl
+import seaborn as sns
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+
+# file path
+PATH_ROOT = "/Users/wesleyyang/Desktop/pcpa"
+PATH_RAW = f"{PATH_ROOT}/project_data"
+PATH_OUT = f"{PATH_ROOT}/final_code.py"
+
+# read in data
+train = pd.read_csv(PATH_RAW + "/SetA.train.csv")
+vehcost = pd.read_csv(PATH_RAW + "/SetB.vehiclecost.csv")
+exposure = pd.read_csv(PATH_RAW + "/SetC.exposure.csv")
+
+# remove duplicates from vehcost
+duplicate_rows = vehcost.duplicated(subset=['veh.make', 'veh.body', 'veh.age','veh.value'], keep="first")
+vehcost1 = vehcost.drop_duplicates(subset=['veh.make', 'veh.body', 'veh.age','veh.value'], keep="first")
+
+#create unified dataset
+train_final = pd.merge(train, vehcost1, on=['veh.make', 'veh.body', 'veh.age'], how='left')
+train_final = pd.merge(train_final, exposure, on=['id'], how='left')
+
+# remove a space after gender letter
+_gender_map = {'M': 'M', 'M ': 'M', 'F': 'F', 'F ': 'F'}
+train_final['gender'] = train_final['gender'].map(_gender_map).astype('category')
+
+#train test split
+rng = np.random.default_rng(seed=24)
+train_final['seg'] = np.where(rng.random(len(train_final)) < 0.8, 'train', 'validation')
+
+#------------------------------------------------
+# Create histograms for each categorical variable
+#------------------------------------------------
+categorical_vars = ['age.cat', 'gender', 'area', 'veh.make', 'veh.age', 'veh.body']
+
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+axes = axes.flatten()
+
+for idx, col in enumerate(categorical_vars):
+    train_final[col].value_counts().sort_index().plot(kind='bar', ax=axes[idx], color='steelblue')
+    axes[idx].set_title(f'Distribution of {col}')
+    axes[idx].set_ylabel('Count')
+    axes[idx].set_xlabel(col)
+    axes[idx].tick_params(axis='x', rotation=45)
+
+for ax in axes[len(categorical_vars):]:
+    ax.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+#-------------------------------
+# Dataset for modeling frequency
+#-------------------------------
+
+train_freq = train_final.drop(columns=['claim', 'tot.cost','id'])
+
+
+#group veh.make 
+_veh_make_map = {'A': 'A', 'B': 'B', 'C': 'CD', 'D': 'CD'}
+train_freq['veh.make_f'] = train_freq['veh.make'].map(_veh_make_map).astype('category')
+
+# group area 
+_area_map = {'A': 'ABC',
+            'B': 'ABC',
+             'C': 'ABC',
+             'D': 'DEF',
+             'E': 'DEF',
+             'F': 'DEF'}
+train_freq['area_f'] = train_freq['area'].map(_area_map).astype('category')
+train_freq['frequency'] = train_freq['num.claims']/train_freq['exposure']
+
+#convert . to -
+train_freq = train_freq.rename(columns=lambda c: c.replace('.', '_').replace('-', '_'))
+
+train_freq.head()
+
+
+#-------------------------------
+# Dataset for modeling Severity
+#-------------------------------
+train_sev = train_final[train_final['claim'] == 1]
+train_sev['severity'] = train_sev['tot.cost'] / train_sev['num.claims']
+
+
+# group veh_make
+_make_map = {'A': 'AB', 'B': 'AB', 'C': 'CD', 'D': 'CD'}
+train_sev['veh.make_s'] = train_sev['veh.make'].map(_make_map).astype('category')
+
+
+# group area
+_area_map = {'A': 'A', 'B': 'Other', 'C': 'Other', 'D': 'Other', 'E': 'Other', 'F': 'Other'}
+train_sev['area_s'] = train_sev['area'].map(_area_map).astype('category')
+
+# group veh_age
+_vehage_map = {1: '12', 2: '12', 3: '34', 4: '34'}
+train_sev['veh.age_s'] = train_sev['veh.age'].map(_vehage_map).astype('category')
+
+
+
+# remove top 3 severity records
+train_sev = train_sev.nsmallest(len(train_sev) - 3, 'severity')
+
+# cap losses
+train_sev['severity'] = train_sev['severity'].clip(upper=12250)
+
+#10-fold CV: randomly assign each record a fold number
+n = len(train_sev)
+fold_sizes = np.full(10, n // 10, dtype=int)
+fold_sizes[: n % 10] += 1
+folds = np.repeat(np.arange(1, 11), fold_sizes)
+rng = np.random.default_rng(seed=77)
+rng.shuffle(folds)
+train_sev['fold'] = pd.Series(folds, index=train_sev.index)
+
+#convert . to -
+
+train_sev = train_sev.rename(columns=lambda c: c.replace('.', '_').replace('-', '_'))
+
+train_sev = train_sev.drop(columns=['claim', 'tot_cost','num_claims','exposure','id'])
+
+print(train_sev['seg'].value_counts())
+
+#---------------------------
+# Distribution of num.claims
+#---------------------------
+plt.figure(figsize=(8, 6))
+ax = sns.histplot(
+    train_final['num.claims'],
+    bins=[-0.5, 0.5, 1.5, 2.5, 3.5],
+    discrete=True,
+    color='steelblue'
+)
+plt.title('Distribution of num.claims')
+plt.xlabel('num.claims')
+plt.ylabel('Count')
+plt.xticks([0, 1, 2, 3])
+
+for patch in ax.patches:
+    ax.annotate(
+        int(patch.get_height()),
+        (patch.get_x() + patch.get_width() / 2, patch.get_height()),
+        ha='center',
+        va='bottom'
+    )
+
+plt.tight_layout()
+plt.show()
+
+#-------------------------
+# Distribution of severity
+#-------------------------
+
+plt.figure(figsize=(8, 6))
+sns.histplot(train_sev['severity'], bins=60, kde=True, color='steelblue')
+plt.title('Severity Distribution')
+plt.xlabel('Severity')
+plt.ylabel('Count')
+plt.tight_layout()
+plt.show()
+
+#----------------------------------------------------------
+# Histograms for each categorical variable using train_freq
+#----------------------------------------------------------
+categorical_vars = ['age_cat', 'gender', 'area_f', 'veh_make_f', 'veh_age', 'veh_body']
+
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+axes = axes.flatten()
+
+for idx, col in enumerate(categorical_vars):
+    train_freq[col].value_counts().sort_index().plot(kind='bar', ax=axes[idx], color='steelblue')
+    axes[idx].set_title(f'Distribution of {col}')
+    axes[idx].set_ylabel('Count')
+    axes[idx].set_xlabel(col)
+    axes[idx].tick_params(axis='x', rotation=45)
+
+for ax in axes[len(categorical_vars):]:
+    ax.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+#-------------------------------
+# One way analysis for frequency
+#-------------------------------
+
+categorical_cols = ['age_cat', 'gender', 'area_f', 'veh_make_f', 'veh_age','veh_body']
+
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+axes = axes.flatten()
+
+for idx, col in enumerate(categorical_cols):
+    grouped = train_freq.groupby(col)['frequency'].agg(['mean', 'count'])
+    if grouped.empty:
+        axes[idx].text(0.5, 0.5, 'No data', ha='center', va='center', fontsize=12)
+        axes[idx].set_xticks([])
+    else:
+        grouped['mean'].plot(kind='bar', ax=axes[idx], color='steelblue')
+    axes[idx].set_title(f'Average frequency by {col}')
+    axes[idx].set_ylabel('Average Frequency')
+    axes[idx].set_xlabel(col)
+    axes[idx].tick_params(axis='x', rotation=45)
+
+for ax in axes[len(categorical_cols):]:
+    ax.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+#----------------------------------------------------------------
+# Create histograms for each categorical variable using train_sev
+#----------------------------------------------------------------
+categorical_vars = ['age_cat', 'gender', 'area_s', 'veh_make_s', 'veh_age_s', 'veh_body']
+
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+axes = axes.flatten()
+
+for idx, col in enumerate(categorical_vars):
+    train_sev[col].value_counts().sort_index().plot(kind='bar', ax=axes[idx], color='steelblue')
+    axes[idx].set_title(f'Distribution of {col}')
+    axes[idx].set_ylabel('Count')
+    axes[idx].set_xlabel(col)
+    axes[idx].tick_params(axis='x', rotation=45)
+
+for ax in axes[len(categorical_vars):]:
+    ax.axis('off')
+
+plt.tight_layout()
+plt.show()
+#------------------------------
+# One way analysis for severity
+#------------------------------
+categorical_cols_sev = ['age_cat', 'gender', 'area_s', 'veh_make_s', 'veh_age_s','veh_body']
+
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+axes = axes.flatten()
+
+for idx, col in enumerate(categorical_cols_sev):
+    grouped = train_sev.groupby(col)['severity'].agg(['mean', 'count']).sort_index()
+    grouped['mean'].plot(kind='bar', ax=axes[idx], color='steelblue')
+    axes[idx].set_title(f'Average Severity by {col}')
+    axes[idx].set_ylabel('Average Severity')
+    axes[idx].set_xlabel(col)
+    axes[idx].tick_params(axis='x', rotation=45)
+
+for ax in axes[len(categorical_cols_sev):]:
+    ax.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+#-----------------------------------------------------------------
+# Forward stepwise selection (Poisson GLM for frequency) using AIC
+#-----------------------------------------------------------------
+train_sel_freq = train_freq.copy()
+train_sel_freq = train_sel_freq.rename(columns=lambda c: c.replace('.', '_').replace('-', '_'))
+
+response_freq = 'num_claims'
+candidates_freq = ['age_cat', 'gender', 'area_f', 'veh_make_f', 'veh_age', 'veh_value','veh_body']
+
+reference_levels_freq = {
+    'gender': 'F',
+    'area_f': 'ABC',
+    'veh_make_f': 'CD',
+    'veh_age': '34',
+    'veh_body': 'B'
+}
+
+for c in ['gender', 'area_f', 'veh_age', 'veh_body','veh_make_f']:
+    if c in train_sel_freq.columns:
+        train_sel_freq[c] = train_sel_freq[c].astype('category')
+        ref = reference_levels_freq.get(c)
+        if ref is not None and ref in train_sel_freq[c].cat.categories:
+            cats = [ref] + [x for x in train_sel_freq[c].cat.categories if x != ref]
+            train_sel_freq[c] = pd.Categorical(train_sel_freq[c], categories=cats, ordered=False)
+
+def _cat_term_freq(cand, df):
+    if str(df[cand].dtype) == 'category':
+        return f'C({cand})'
+    return cand
+
+current_features_freq = []
+df_train_fs_freq = train_sel_freq
+
+model_freq = smf.glm(
+    formula=f'{response_freq} ~ 1',
+    data=df_train_fs_freq,
+    family=sm.families.Poisson(sm.families.links.Log()),
+    offset=np.log(df_train_fs_freq['exposure'])
+).fit()
+
+best_aic_freq = model_freq.aic
+remaining_freq = candidates_freq.copy()
+improved_freq = True
+
+while improved_freq and remaining_freq:
+    improved_freq = False
+    best_candidate_freq = None
+    best_candidate_aic_freq = best_aic_freq
+    for cand in remaining_freq:
+        term = _cat_term_freq(cand, train_sel_freq)
+        formula_freq = (
+            f'{response_freq} ~ {" + ".join(current_features_freq + [term])}'
+            if current_features_freq
+            else f'{response_freq} ~ {term}'
+        )
+        try:
+            fm_freq = smf.glm(
+                formula=formula_freq,
+                data=df_train_fs_freq,
+                family=sm.families.Poisson(sm.families.links.Log()),
+                offset=np.log(df_train_fs_freq['exposure'])
+            ).fit()
+            if fm_freq.aic < best_candidate_aic_freq:
+                best_candidate_aic_freq = fm_freq.aic
+                best_candidate_freq = cand
+                best_candidate_model_freq = fm_freq
+        except Exception:
+            continue
+
+    if best_candidate_freq is not None and best_candidate_aic_freq < best_aic_freq:
+        current_features_freq.append(_cat_term_freq(best_candidate_freq, train_sel_freq))
+        remaining_freq.remove(best_candidate_freq)
+        best_aic_freq = best_candidate_aic_freq
+        final_model_freq = best_candidate_model_freq
+        improved_freq = True
+
+print('Selected formula:', f'{response_freq} ~ {" + ".join(current_features_freq) if current_features_freq else "1"}')
+print('AIC:', best_aic_freq)
+print(final_model_freq.summary())
+
+#--------------------------------------------------------------
+# Forward stepwise selection (Gamma GLM for severity) using AIC
+#--------------------------------------------------------------
+
+train_sel_sev = train_sev.copy()
+train_sel_sev = train_sel_sev.rename(columns=lambda c: c.replace('.', '_').replace('-', '_'))
+
+# response, candidates
+response_sev = 'severity'
+candidates_sev = ['age_cat','gender','area_s','veh_body','veh_make_s','veh_age_s','veh_value']
+
+# selected base levels for categorical predictors
+reference_levels_sev = {
+
+    'gender': 'F',
+    'area_s': 'Other',
+    'veh_make_s': 'CD',
+    'veh_body': 'SEDAN',
+    'veh_age_s': '34'
+}
+
+# ensure categorical dtype for nominal predictors and fix reference level order
+for c in ['gender', 'area_s', 'veh_age_s','veh_body','veh_make_s']:
+    if c in train_sel_sev.columns:
+        train_sel_sev[c] = train_sel_sev[c].astype('category')
+        ref = reference_levels_sev.get(c)
+        if ref is not None and ref in train_sel_sev[c].cat.categories:
+            cats = [ref] + [x for x in train_sel_sev[c].cat.categories if x != ref]
+            train_sel_sev[c] = pd.Categorical(train_sel_sev[c], categories=cats, ordered=False)
+
+
+# helper to build categorical terms for forward selection
+def _cat_term_sev(cand, df):
+    if str(df[cand].dtype) == 'category':
+        return f'C({cand})'
+    return cand
+
+
+# forward stepwise by AIC
+current_features_sev = []
+best_aic_sev = None
+df_train_fs_sev = train_sel_sev
+
+# fit intercept-only model
+model_sev = smf.glm(formula=f'{response_sev} ~ 1', data=df_train_fs_sev,
+                family=sm.families.Gamma(sm.families.links.Log())).fit()
+best_aic_sev = model_sev.aic
+
+remaining_sev = candidates_sev.copy()
+improved_sev = True
+
+while improved_sev and remaining_sev:
+    improved_sev = False
+    best_candidate_sev = None
+    best_candidate_aic_sev = best_aic_sev
+    for cand in remaining_sev:
+        term = _cat_term_sev(cand, train_sel_sev)
+        formula_sev = f'{response_sev} ~ {" + ".join(current_features_sev + [term])}' if current_features_sev else f'{response_sev} ~ {term}'
+        try:
+            fm_sev = smf.glm(
+                formula=formula_sev,
+                data=df_train_fs_sev,
+                family=sm.families.Gamma(sm.families.links.Log())
+            ).fit()
+            if fm_sev.aic < best_candidate_aic_sev:
+                best_candidate_aic_sev = fm_sev.aic
+                best_candidate_sev = cand
+                best_candidate_model_sev = fm_sev
+        except Exception:
+            continue
+
+    if best_candidate_sev is not None and best_candidate_aic_sev < best_aic_sev:
+        term = _cat_term_sev(best_candidate_sev, train_sel_sev)
+        current_features_sev.append(term)
+        remaining_sev.remove(best_candidate_sev)
+        best_aic_sev = best_candidate_aic_sev
+        final_model_sev = best_candidate_model_sev
+        improved_sev = True
+
+print('Selected formula:', f'{response_sev} ~ {" + ".join(current_features_sev) if current_features_sev else "1"}')
+print('AIC:', best_aic_sev)
+print(final_model_sev.summary())
+
+
+#---------------------------------------
+# frequency Coefficient plot with 95% CI (not in report)
+#---------------------------------------
+
+coef = final_model_freq.params.copy()
+ci = final_model_freq.conf_int(alpha=0.05).copy()
+coef_df = pd.DataFrame({
+    'term': coef.index,
+    'coef': coef.values,
+    'ci_low': ci[0].values,
+    'ci_high': ci[1].values
+}).reset_index(drop=True)
+
+# drop intercept
+coef_df = coef_df[~coef_df['term'].str.contains('Intercept', regex=False)].reset_index(drop=True)
+
+# detect categorical terms from statsmodels naming (e.g. C(var)[T.level])
+def parse_cat(term):
+    # returns (var, level) or (None, None)
+    if 'C(' in term and ']' in term:
+        # form: C(var)[T.level] or C(var)[T.level]:something
+        var = term.split('C(')[1].split(')')[0]
+        level = term.split(']')[0].split('[')[1].replace('T.', '')
+        return var, level
+    return None, None
+
+# compute counts for categorical levels
+counts = []
+for t in coef_df['term']:
+    var, level = parse_cat(t)
+    if var is not None:
+        cnt = int(train_sel_freq[var].eq(level).sum())
+    else:
+        cnt = 0
+    counts.append(cnt)
+coef_df['count'] = counts
+
+# ordering for display
+coef_df = coef_df.sort_values('coef').reset_index(drop=True)
+y = np.arange(len(coef_df))
+
+# scale counts into a background width range
+xmin = coef_df['ci_low'].min()
+xmax = coef_df['ci_high'].max()
+width_range = xmax - xmin if xmax > xmin else 1.0
+max_count = coef_df['count'].max() if coef_df['count'].max() > 0 else 1
+scale_factor = (width_range * 0.6) / max_count
+
+fig, ax = plt.subplots(figsize=(8, max(4, len(coef_df)*0.4)))
+
+# draw background bars for categorical levels
+for i, row in coef_df.iterrows():
+    if row['count'] > 0:
+        bar_left = xmin + width_range * 0.05
+        bar_width = row['count'] * scale_factor
+        ax.barh(y[i], bar_width, left=bar_left, color='grey', alpha=0.25)
+        ax.text(bar_left + bar_width + width_range*0.02, y[i], str(row['count']),
+                va='center', fontsize=8, color='grey')
+
+# plot coefficients with 95% CI whiskers
+ax.errorbar(coef_df['coef'], y, xerr=[coef_df['coef'] - coef_df['ci_low'], coef_df['ci_high'] - coef_df['coef']],
+            fmt='o', color='C1', capsize=4, lw=1.5)
+
+ax.set_yticks(y)
+ax.set_yticklabels(coef_df['term'])
+ax.axvline(0, color='k', linestyle='--', linewidth=0.8)
+ax.set_xlabel('Coefficient estimate (log link scale)')
+ax.set_title('Frequency Model Coefficients with 95% CI')
+plt.tight_layout()
+plt.show()
+
+#---------------------------------------
+# Severity Coefficient plot with 95% CI (not in report)
+#---------------------------------------
+
+coef = final_model_sev.params.copy()
+ci = final_model_sev.conf_int(alpha=0.05).copy()
+coef_df = pd.DataFrame({
+    'term': coef.index,
+    'coef': coef.values,
+    'ci_low': ci[0].values,
+    'ci_high': ci[1].values
+}).reset_index(drop=True)
+
+# drop intercept
+coef_df = coef_df[~coef_df['term'].str.contains('Intercept', regex=False)].reset_index(drop=True)
+
+# detect categorical terms from statsmodels naming (e.g. C(var)[T.level])
+def parse_cat(term):
+    # returns (var, level) or (None, None)
+    if 'C(' in term and ']' in term:
+        # form: C(var)[T.level] or C(var)[T.level]:something
+        var = term.split('C(')[1].split(')')[0]
+        level = term.split(']')[0].split('[')[1].replace('T.', '')
+        return var, level
+    return None, None
+
+# compute counts for categorical levels
+counts = []
+for t in coef_df['term']:
+    var, level = parse_cat(t)
+    if var is not None:
+        cnt = int(train_sel_sev[var].eq(level).sum())
+    else:
+        cnt = 0
+    counts.append(cnt)
+coef_df['count'] = counts
+
+# ordering for display
+coef_df = coef_df.sort_values('coef').reset_index(drop=True)
+y = np.arange(len(coef_df))
+
+# scale counts into a background width range
+xmin = coef_df['ci_low'].min()
+xmax = coef_df['ci_high'].max()
+width_range = xmax - xmin if xmax > xmin else 1.0
+max_count = coef_df['count'].max() if coef_df['count'].max() > 0 else 1
+scale_factor = (width_range * 0.6) / max_count
+
+fig, ax = plt.subplots(figsize=(8, max(4, len(coef_df)*0.4)))
+
+# draw background bars for categorical levels
+for i, row in coef_df.iterrows():
+    if row['count'] > 0:
+        bar_left = xmin + width_range * 0.05
+        bar_width = row['count'] * scale_factor
+        ax.barh(y[i], bar_width, left=bar_left, color='grey', alpha=0.25)
+        ax.text(bar_left + bar_width + width_range*0.02, y[i], str(row['count']),
+                va='center', fontsize=8, color='grey')
+
+# plot coefficients with 95% CI whiskers
+ax.errorbar(coef_df['coef'], y, xerr=[coef_df['coef'] - coef_df['ci_low'], coef_df['ci_high'] - coef_df['coef']],
+            fmt='o', color='C1', capsize=4, lw=1.5)
+
+ax.set_yticks(y)
+ax.set_yticklabels(coef_df['term'])
+ax.axvline(0, color='k', linestyle='--', linewidth=0.8)
+ax.set_xlabel('Coefficient estimate (log link scale)')
+ax.set_title('Severity Model Coefficients with 95% CI')
+plt.tight_layout()
+plt.show()
+
+#---------------------------------------------------
+# Train-test split on frequency model for validation
+#---------------------------------------------------
+
+
+df_train = train_sel_freq[train_sel_freq['seg'] == 'train'].copy()
+
+train_sel_freq['area_f'] = pd.Categorical(
+    train_sel_freq['area_f'],
+    categories=['ABC','DEF'],
+    ordered=False
+)
+
+train_sel_freq['veh_make_f'] = pd.Categorical(
+    train_sel_freq['veh_make_f'],
+    categories=['CD','A','B'],
+    ordered=False
+)
+
+
+
+formula = 'num_claims ~  age_cat + veh_value  + C(area_f) + C(veh_make_f) '
+
+model_freq = smf.glm(
+    formula=formula,
+    data=df_train,
+    family=sm.families.Poisson(sm.families.links.Log()),
+    offset=np.log(df_train['exposure'])
+).fit()
+
+
+# Apply the frequency model to the validation dataset
+df_valid_freq = train_sel_freq[train_sel_freq['seg'] == 'validation'].copy()
+
+
+df_valid_freq['predicted_num_claims'] = model_freq.predict(df_valid_freq,offset=np.log(df_valid_freq['exposure']))
+df_valid_freq['pred_freq'] = df_valid_freq['predicted_num_claims']/df_valid_freq['exposure']
+
+#Create lift chart for num.claims
+
+# Bin validation rows into deciles using qcut on rank
+df = df_valid_freq.copy()
+df['decile'] = pd.qcut(df['predicted_num_claims'].rank(method='first', ascending=True), 10, labels=False) + 1
+
+# Aggregate actual and predicted claim ct by decile
+decile_stats = df.groupby('decile').agg(
+    Avg_actual_count=('num_claims', 'mean'),
+    Avg_pred_count=('predicted_num_claims', 'mean'),
+    #Avg_exposure =('exposure','mean'),
+    Count=('frequency', 'count')
+).reset_index().sort_values('decile')
+
+# Plot actual vs predicted frequency across deciles
+plt.figure(figsize=(10, 6))
+plt.plot(decile_stats['decile'], decile_stats['Avg_actual_count'], marker='o', label='Actual claim count')
+plt.plot(decile_stats['decile'], decile_stats['Avg_pred_count'], marker='o', label='Predicted claim count')
+#plt.plot(decile_stats['decile'], decile_stats['Avg_exposure'], marker='o', label='average exposure')
+plt.title('Decile Claim Count - Actual vs Predicted')
+plt.xlabel('Decile')
+plt.ylabel('Claim Count')
+plt.xticks(decile_stats['decile'])
+plt.grid(True, linestyle=':', alpha=0.5)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+print(decile_stats)
+
+
+
+#-------------------------------------------
+#10-fold CV on severity model for validation
+#-------------------------------------------
+
+formula = 'severity ~ age_cat + C(area_s) + C(veh_make_s) + C(veh_age_s)'
+df_valid_sev = train_sev.copy()
+
+cat_levels = {
+    'veh_make_s': ['CD', 'AB'],
+    'area_s': ['Other', 'A'],
+    'veh_age_s': ['34', '12']
+}
+
+for col, cats in cat_levels.items():
+    df_valid_sev[col] = pd.Categorical(df_valid_sev[col], categories=cats, ordered=False)
+
+for i in range(1, 11):
+    df_train = train_sev[train_sev['fold'] != i].copy()
+    for col, cats in cat_levels.items():
+        df_train[col] = pd.Categorical(df_train[col], categories=cats, ordered=False)
+
+    model_sev = smf.glm(
+        formula=formula,
+        data=df_train,
+        family=sm.families.Gamma(sm.families.links.Log()),
+    ).fit()
+
+    mask = df_valid_sev['fold'] == i
+    df_valid_sev.loc[mask, f'pred_sev_{i}'] = model_sev.predict(df_valid_sev.loc[mask])
+
+
+pred_cols = [f'pred_sev_{i}' for i in range(1, 11)]
+df_valid_sev['pred_sev'] = df_valid_sev[pred_cols].bfill(axis=1).iloc[:, 0]
+
+if df_valid_sev['pred_sev'].isna().any():
+    raise ValueError("Some rows are missing CV predictions")
+
+#Create severity lift chart
+
+# Bin validation rows into deciles using qcut on rank
+df = df_valid_sev.copy()
+df['decile'] = pd.qcut(df['pred_sev'].rank(method='first', ascending=True), 10, labels=False) + 1
+
+# Aggregate actual and predicted claim ct by decile
+decile_stats = df.groupby('decile').agg(
+    Avg_actual_sev=('severity', 'mean'),
+    Avg_pred_sev=('pred_sev', 'mean'),
+    #Avg_exposure =('exposure','mean'),
+    Count=('severity', 'count')
+).reset_index().sort_values('decile')
+
+# Plot actual vs predicted frequency across deciles
+plt.figure(figsize=(10, 6))
+plt.plot(decile_stats['decile'], decile_stats['Avg_actual_sev'], marker='o', label='Actual severity')
+plt.plot(decile_stats['decile'], decile_stats['Avg_pred_sev'], marker='o', label='Predicted severity')
+#plt.plot(decile_stats['decile'], decile_stats['Avg_exposure'], marker='o', label='average exposure')
+plt.title('Decile severity - Actual vs Predicted')
+plt.xlabel('Decile')
+plt.ylabel('Severity')
+plt.xticks(decile_stats['decile'])
+plt.grid(True, linestyle=':', alpha=0.5)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+print(decile_stats)
+
+#--------------------------
+#lorenz curve for frequency
+#--------------------------
+
+df_lorenz = df_valid_freq[['num_claims', 'predicted_num_claims']].copy()
+df_lorenz = df_lorenz.sort_values('predicted_num_claims').reset_index(drop=True)
+
+total_claims = df_lorenz['num_claims'].sum()
+if total_claims == 0:
+    raise ValueError("Validation set contains no claims, cannot compute Lorenz curve.")
+
+df_lorenz['cum_population'] = np.arange(1, len(df_lorenz) + 1) / len(df_lorenz)
+df_lorenz['cum_claims_pct'] = df_lorenz['num_claims'].cumsum() / total_claims
+
+lorenz_x = np.concatenate([[0.0], df_lorenz['cum_population'].values])
+lorenz_y = np.concatenate([[0.0], df_lorenz['cum_claims_pct'].values])
+
+gini_area = np.sum((lorenz_x[1:] - lorenz_x[:-1]) * (lorenz_y[1:] + lorenz_y[:-1]) / 2)
+gini_coef = 1 - 2 * gini_area
+
+plt.figure(figsize=(8, 6))
+plt.plot(lorenz_x, lorenz_y, marker='o', label='Lorenz curve')
+plt.plot([0, 1], [0, 1], color='red', linestyle='--', label='Line of equality')
+plt.fill_between(lorenz_x, lorenz_y, lorenz_x, where=(lorenz_y < lorenz_x), color='lightblue', alpha=0.3)
+plt.title('Lorenz Curve for Frequency Model (Gini Coef. = 0.3215)')
+plt.xlabel('Cumulative share of policies ordered by predicted frequency')
+plt.ylabel('Cumulative share of actual claims')
+plt.legend()
+plt.grid(True, linestyle=':', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
+print(f'Gini coefficient: {gini_coef:.4f}')
+
+#-------------------------
+#lorenz curve for severity
+#-------------------------
+
+df_lorenz = df_valid_sev[['severity', 'pred_sev']].copy()
+df_lorenz = df_lorenz.sort_values('pred_sev').reset_index(drop=True)
+
+total_claims = df_lorenz['severity'].sum()
+if total_claims == 0:
+    raise ValueError("Validation set contains no claims, cannot compute Lorenz curve.")
+
+df_lorenz['cum_population'] = np.arange(1, len(df_lorenz) + 1) / len(df_lorenz)
+df_lorenz['cum_claims_pct'] = df_lorenz['severity'].cumsum() / total_claims
+
+lorenz_x = np.concatenate([[0.0], df_lorenz['cum_population'].values])
+lorenz_y = np.concatenate([[0.0], df_lorenz['cum_claims_pct'].values])
+
+gini_area = np.sum((lorenz_x[1:] - lorenz_x[:-1]) * (lorenz_y[1:] + lorenz_y[:-1]) / 2)
+gini_coef = 1 - 2 * gini_area
+
+plt.figure(figsize=(8, 6))
+plt.plot(lorenz_x, lorenz_y, marker='o', label='Lorenz curve')
+plt.plot([0, 1], [0, 1], color='red', linestyle='--', label='Line of equality')
+plt.fill_between(lorenz_x, lorenz_y, lorenz_x, where=(lorenz_y < lorenz_x), color='lightblue', alpha=0.3)
+plt.title('Lorenz Curve for Severity Model (Gini Coef. = 0.0825)')
+plt.xlabel('Cumulative share of policies ordered by predicted severity')
+plt.ylabel('Cumulative share of actual claims')
+plt.legend()
+plt.grid(True, linestyle=':', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
+print(f'Gini coefficient: {gini_coef:.4f}')
+
+#---------------------------------------------
+#run model on test dataset (need to send this)
+#---------------------------------------------
+
+
+test = pd.read_csv(PATH_RAW + "/SetA.test.csv").copy()
+
+#merge exposure and vehcost
+test = pd.merge(test, exposure, on=['id'], how='left')
+test = pd.merge(test, vehcost1, on=['veh.make', 'veh.body', 'veh.age'], how='left')
+
+
+#convert . to -
+test = test.rename(columns=lambda c: c.replace('.', '_').replace('-', '_'))
+
+# group area 
+_area_map_freq = {'A': 'ABC',
+            'B': 'ABC',
+             'C': 'ABC',
+             'D': 'DEF',
+             'E': 'DEF',
+             'F': 'DEF'}
+test['area_f'] = test['area'].map(_area_map_freq).astype('category')
+
+_area_map_sev = {'A': 'A',
+            'B': 'Other',
+             'C': 'Other',
+             'D': 'Other',
+             'E': 'Other',
+             'F': 'Other'}
+test['area_s'] = test['area'].map(_area_map_sev).astype('category')
+
+
+# group veh_make
+_make_map = {'A': 'AB', 'B': 'AB', 'C': 'CD', 'D': 'CD'}
+test['veh_make_s'] = test['veh_make'].map(_make_map).astype('category')
+
+_make_map = {'A': 'A', 'B': 'B', 'C': 'CD', 'D': 'CD'}
+test['veh_make_f'] = test['veh_make'].map(_make_map).astype('category')
+
+# group veh_age
+_vehage_map = {1: '12', 2: '12', 3: '34', 4: '34'}
+test['veh_age_s'] = test['veh_age'].map(_vehage_map).astype('category')
+
+
+#predict
+test['num_claims'] = final_model_freq.predict(test,offset=np.log(test['exposure']))
+
+test['severity'] = final_model_sev.predict(test)
+
+test['tot_cost'] =  test['severity']*test['num_claims']
+
+threshold = np.percentile(test['num_claims'],93.21)
+test['claim'] = np.where(test['num_claims']>=threshold,1,0)
+test = test.drop(columns=['area_f','veh_make_f','area_s','veh_make_s','veh_age_s','severity','exposure','veh_value'])
+
+test = test.rename(columns=lambda c: c.replace('_', '.'))
+
+#final output
+test.to_csv('setA.test.csv',index=False)
